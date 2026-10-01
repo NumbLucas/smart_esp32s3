@@ -1,8 +1,10 @@
 #include "screen_driver.h"
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "driver/spi_common.h"
 #include "driver/i2c_master.h"
 #include "esp_lcd_co5300.h"
@@ -11,15 +13,18 @@
 #include "esp_lcd_touch.h"
 #include "esp_lcd_touch_cst820.h"
 #include "esp_lcd_uc8176.h"
+#include "ssd1306_oled.h"
+#include "servo_driver.h"
 #include "freertos/semphr.h"
 #include "image.h"
 
 #define USE_EPAPER_SCREEN
+// #define USE_SSD1306_OLED
 // #define USE_AMOLED
 
 #define PIN_NUM_EPAPER_SCL 38 //褐 CH1
 #define PIN_NUM_EPAPER_SDA 39 //白 CH3
-#define PIN_NUM_EPAPER_RST 40 //灰 CH5
+#define PIN_NUM_EPAPER_RST 40 //灰 CH5 
 #define PIN_NUM_EPAPER_DC 41  //紫 CH7
 #define PIN_NUM_EPAPER_CS 42  // 红 CH2
 #define PIN_NUM_EPAPER_BUSY 46  // 褐2 
@@ -48,6 +53,9 @@ static char *TAG = "screen driver";
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static esp_lcd_panel_io_handle_t spi_io_handle = NULL;
 static esp_lcd_panel_io_handle_t i2c_io_handle = NULL;
+static i2c_master_bus_handle_t oled_i2c_bus = NULL;
+static i2c_master_dev_handle_t sht40_i2c_dev = NULL;
+static ssd1306_oled_handle_t oled_handle = NULL;
 
 static SemaphoreHandle_t touch_mux = NULL;
 
@@ -60,31 +68,181 @@ void init_co5300_display(void);
 void init_cst820_touch(void);
 
 void init_epd(void);
+static esp_err_t sht40_init(void)
+{
+    if (oled_i2c_bus == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (sht40_i2c_dev != NULL) {
+        return ESP_OK;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x44,
+        .scl_speed_hz = 100000,
+    };
+
+    return i2c_master_bus_add_device(oled_i2c_bus, &dev_cfg, &sht40_i2c_dev);
+}
+
+static esp_err_t sht40_read_temperature_humidity(float *temperature_c, float *humidity_rh)
+{
+    if (temperature_c == NULL || humidity_rh == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (sht40_i2c_dev == NULL) {
+        esp_err_t ret = sht40_init();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    uint8_t cmd = 0xFD; // high-precision measurement for SHT40
+    uint8_t rx_buf[6] = {0};
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        esp_err_t ret = i2c_master_transmit(sht40_i2c_dev, &cmd, 1, pdMS_TO_TICKS(100));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "SHT40 transmit failed, attempt %d/%d: %s", attempt + 1, 3, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        ret = i2c_master_receive(sht40_i2c_dev, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(100));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "SHT40 receive failed, attempt %d/%d: %s", attempt + 1, 3, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+
+        if (rx_buf[2] == 0x00 && rx_buf[5] == 0x00) {
+            ESP_LOGW(TAG, "SHT40 received invalid data, retrying");
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        uint16_t raw_temp = ((uint16_t)rx_buf[0] << 8) | rx_buf[1];
+        uint16_t raw_humidity = ((uint16_t)rx_buf[3] << 8) | rx_buf[4];
+
+        *temperature_c = -45.0f + 175.0f * (float)raw_temp / 65535.0f;
+        *humidity_rh = -6.0f + 125.0f * (float)raw_humidity / 65535.0f;
+        return ESP_OK;
+    }
+
+    return ESP_ERR_TIMEOUT;
+}
+
+void init_oled_display(void)
+{
+    const i2c_master_bus_config_t bus_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .i2c_port = I2C_NUM_1,
+        .sda_io_num = PIN_NUM_SDA,
+        .scl_io_num = PIN_NUM_SCL,
+        .flags.enable_internal_pullup = true,
+    };
+
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &oled_i2c_bus));
+    ESP_ERROR_CHECK(ssd1306_oled_init(oled_i2c_bus, SSD1306_OLED_I2C_ADDRESS, &oled_handle));
+
+    ssd1306_oled_clear(oled_handle);
+    ssd1306_oled_draw_string(oled_handle, 0, 0, "ESP32");
+    ssd1306_oled_draw_string(oled_handle, 0, 16, "SSD1306");
+    ssd1306_oled_draw_string(oled_handle, 0, 32, "128x64");
+    ssd1306_oled_draw_string(oled_handle, 0, 48, "I2C OK");
+    ssd1306_oled_refresh(oled_handle);
+    ESP_LOGI(TAG, "SSD1306 OLED initialized");
+}
+
+static void format_clock_string(char *buf, size_t buf_size)
+{
+    uint64_t now_ms = esp_timer_get_time() / 1000ULL;
+    uint32_t seconds = (uint32_t)(now_ms / 1000ULL);
+    uint32_t hour = (seconds / 3600U) % 24U;
+    uint32_t minute = (seconds / 60U) % 60U;
+    snprintf(buf, buf_size, "%02lu:%02lu", (unsigned long)hour, (unsigned long)minute);
+}
+
+static void draw_status_bar(const char *time_text, const char *device_state, const char *wifi_state)
+{
+    char bar[32] = {0};
+    snprintf(bar, sizeof(bar), "%s %s %s", time_text, device_state, wifi_state);
+    ssd1306_oled_draw_string(oled_handle, 0, 0, bar);
+}
+
+void oled_demo_display(void)
+{
+    if (oled_handle == NULL) {
+        ESP_LOGW(TAG, "OLED handle is NULL, call init_oled_display first");
+        return;
+    }
+
+    float temperature_c = 0.0f;
+    float humidity_rh = 0.0f;
+    char time_buf[16] = {0};
+    char status_line[32] = {0};
+    char line1[32] = {0};
+    char line2[32] = {0};
+    char line3[32] = {0};
+    const char *device_state = "ERR";
+    const char *wifi_state = "WIFI";
+
+    format_clock_string(time_buf, sizeof(time_buf));
+
+    if (sht40_read_temperature_humidity(&temperature_c, &humidity_rh) == ESP_OK) {
+        device_state = "OK";
+        servo_update_temperature(temperature_c);
+        snprintf(line1, sizeof(line1), "TEMP: %.1fC", temperature_c);
+        snprintf(line2, sizeof(line2), "HUM: %.1f%%", humidity_rh);
+        snprintf(line3, sizeof(line3), "SHT40 READY");
+    } else {
+        snprintf(line1, sizeof(line1), "TEMP: --.-C");
+        snprintf(line2, sizeof(line2), "HUM: --.-%%");
+        snprintf(line3, sizeof(line3), "SHT40 FAIL");
+    }
+
+    snprintf(status_line, sizeof(status_line), "%s %s", device_state, wifi_state);
+
+    ssd1306_oled_clear(oled_handle);
+    draw_status_bar(time_buf, device_state, wifi_state);
+    ssd1306_oled_draw_string(oled_handle, 0, 16, line1);
+    ssd1306_oled_draw_string(oled_handle, 0, 32, line2);
+    ssd1306_oled_draw_string(oled_handle, 0, 48, line3);
+    ssd1306_oled_refresh(oled_handle);
+}
+
+static void sht40_oled_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        oled_demo_display();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
 
 void init_screen(void)
 {
-#ifdef USE_EPAPER_SCREEN
+#ifdef USE_SSD1306_OLED
+    // init_oled_display();
+    // xTaskCreate(sht40_oled_task, "sht40_oled_task", 4096, NULL, 5, NULL);
+    xTaskCreate(servo_demo_task, "servo_demo_task", 4096, NULL, 5, NULL);
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#elif defined(USE_EPAPER_SCREEN)
     init_epd();
     vTaskDelay(pdMS_TO_TICKS(1000));
-    full_default_image();
-    vTaskDelay(pdMS_TO_TICKS(40000));
+    full_black();
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    ESP_LOGI(TAG, "vTaskDelay");
     epaper_panel_uc8176_sleep(panel_handle);
-    // while(1)
-    // {
-    //     full_black();
-    //     vTaskDelay(pdMS_TO_TICKS(50000));
-    //     full_white();
-    //     vTaskDelay(pdMS_TO_TICKS(50000));
-    //     full_red();
-    //     vTaskDelay(pdMS_TO_TICKS(50000));
-    // }
-
-    
-    // full_black();
-    // epaper_panel_uc8176_sleep(panel_handle);
-    // vTaskDelay(pdMS_TO_TICKS(20000));
-
-    // full_red();
 #else
     init_co5300_display();
 

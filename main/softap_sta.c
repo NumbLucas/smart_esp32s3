@@ -343,11 +343,5 @@ void app_main(void)
 
     // xTaskCreate(camera_task, "camera_task", CAMERA_TASK_STACK_SIZE_BYTES, NULL, configMAX_PRIORITIES - 5, NULL);
 
-    // vTaskStartScheduler();
-
-    // while(1)
-    // {
-    //     vTaskDelay(1000 / portTICK_PERIOD_MS);
-    // }
     // camera_capture();
 }

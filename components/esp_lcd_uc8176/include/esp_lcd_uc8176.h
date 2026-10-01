@@ -50,7 +50,7 @@ esp_err_t EPD_WhiteScreen_ALL(esp_lcd_panel_t *panel, const unsigned char* datas
         .sclk_io_num = sclk,                                    \
         .mosi_io_num = mosi,                                     \
         .max_transfer_sz = max_trans_sz,                        \
-    }
+}
 
 /**
  * @brief LCD panel IO configuration structure

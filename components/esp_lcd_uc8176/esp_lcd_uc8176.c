@@ -83,7 +83,7 @@ static const uc8176_lcd_cmds_sequence_t vendor_specific_sleep_default[] = {
     //  {cmd, { data }, data_size, delay_ms, wait_busy_sig}
     {0x50, (uint8_t[]){0xf7}, 1, 0, 0},                 // 
     {0x02, (uint8_t[]){0x00}, 0, 100, 1},                   // 
-    {0x07, (uint8_t[]){0x05}, 1, 0, 0},                   // 
+    {0x07, (uint8_t[]){0xA5}, 1, 0, 0},                   // 
 };
 
 static esp_err_t panel_epaper_wait_busy(esp_lcd_panel_t *panel)
